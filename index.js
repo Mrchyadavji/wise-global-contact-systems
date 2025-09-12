@@ -400,6 +400,10 @@ app.get('/api/economic', async (req, res) => {
     res.status(500).json({ error: 'failed to load economic data' });
   }
 });
+// Root route (for browser check)
+app.get("/", (req, res) => {
+  res.send("🚀 Wise Global Contact System backend is live!");
+});
 
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
