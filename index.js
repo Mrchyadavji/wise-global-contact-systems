@@ -136,8 +136,20 @@ if (resolvedBuildPath) {
 } else {
   // Fallback: when no build exists in the deployed app, return a helpful
   // message at root rather than an opaque 404 so the deploy logs make sense.
+  // This message is intentionally actionable for common hosts (Render, Heroku, etc.).
   app.get('/', (req, res) => {
-    res.status(200).send('Server is running, but static frontend (build/) is missing. Please run `npm run build` or configure the deploy to build the frontend.');
+    res.status(200).send(
+      'Server is running, but the frontend build/ is missing.\n\n' +
+      'What to do locally:\n' +
+      '  1) From the repository root run: npm install && npm run build\n' +
+      '  2) Commit or copy the generated build/ directory so the server can serve static files.\n\n' +
+      "What to do on Render (recommended):\n" +
+      "  1) Connect your GitHub repo to Render (Web Service).\n" +
+      "  2) Set the Build Command to: npm install && npm run build\n" +
+      "  3) Set the Start Command to: node server/index.js\n" +
+      "  4) Add environment variables (SMTP_SERVER, SMTP_PORT, SMTP_USER, SMTP_PASS, EMAIL_FROM, INFO_EMAIL_TO, CAREER_EMAIL, SUPPORT_EMAIL_TO, FIREBASE_DATABASE_URL).\n\n" +
+      "Why this appears: the Express server will only serve static files when a build/ folder exists at runtime. The build step must run before the server starts in production."
+    );
   });
 }
 
@@ -351,6 +363,14 @@ const emailSchema = z.object({
   email: z.string().optional(),
   message: z.string().optional(),
   source: z.string().optional(),
+  // Optional fields used by specific forms
+  to: z.string().optional(), // comma-separated recipients
+  subject: z.string().optional(),
+  pageUrl: z.string().optional(),
+  type: z.string().optional(),
+  severity: z.string().optional(),
+  device: z.string().optional(),
+  assistiveTech: z.string().optional(),
 });
 
 // Accept both JSON and multipart/form-data (with optional file named 'resume')
@@ -371,7 +391,14 @@ app.post('/send-email', upload.single('resume'), async (req, res) => {
       interest = '',
       email: userEmail = '',
       message = '',
-      source = ''
+      source = '',
+      to: toField = '',
+      subject: subjectField = '',
+      pageUrl = '',
+      type: formType = '',
+      severity: formSeverity = '',
+      device: formDevice = '',
+      assistiveTech: formAssistive = ''
     } = parse.data;
 
     // Create transporter from env when available; otherwise use Ethereal in non-production
@@ -414,6 +441,11 @@ app.post('/send-email', upload.single('resume'), async (req, res) => {
     let recipients = [];
     const isCareerSubmission = String(source).toLowerCase() === 'career' || String(interest).toLowerCase().includes('career');
 
+    if (toField && String(toField).trim()) {
+      // Allow client to request specific recipients (comma-separated). Server will still dedupe and validate.
+      recipients = recipients.concat(String(toField).split(',').map(s => s.trim()).filter(Boolean));
+    }
+
     if (isCareerSubmission) {
       // For career submissions, send only to the career mailbox
       recipients.push(careerEmail);
@@ -436,7 +468,7 @@ app.post('/send-email', upload.single('resume'), async (req, res) => {
 
     console.debug('Sending notification email to:', to);
 
-    const subject = `New website submission: ${interest || 'Interest'}${source ? ` (${source})` : ''}`;
+    const subject = subjectField || `New website submission: ${interest || 'Interest'}${source ? ` (${source})` : ''}`;
     const textParts = [
       `You have a new submission from the website:`,
       `Name: ${name}`,
@@ -445,6 +477,11 @@ app.post('/send-email', upload.single('resume'), async (req, res) => {
       `City: ${city}`,
       `Interest: ${interest}`,
     ];
+    if (formType) textParts.push(`Type: ${formType}`);
+    if (formSeverity) textParts.push(`Severity: ${formSeverity}`);
+    if (formDevice) textParts.push(`Device: ${formDevice}`);
+    if (formAssistive) textParts.push(`Assistive Tech: ${formAssistive}`);
+    if (pageUrl) textParts.push(`Page URL: ${pageUrl}`);
     if (message) textParts.push(`Message: ${message}`);
     if (source) textParts.push(`Source: ${source}`);
     textParts.push('\n-- End of message');
@@ -458,6 +495,11 @@ app.post('/send-email', upload.single('resume'), async (req, res) => {
         <li><strong>Mobile:</strong> ${mobile}</li>
         <li><strong>City:</strong> ${city}</li>
         <li><strong>Interest:</strong> ${interest}</li>
+        ${formType ? `<li><strong>Type:</strong> ${formType}</li>` : ''}
+        ${formSeverity ? `<li><strong>Severity:</strong> ${formSeverity}</li>` : ''}
+        ${formDevice ? `<li><strong>Device:</strong> ${formDevice}</li>` : ''}
+        ${formAssistive ? `<li><strong>Assistive Tech:</strong> ${formAssistive}</li>` : ''}
+        ${pageUrl ? `<li><strong>Page URL:</strong> ${pageUrl}</li>` : ''}
         ${message ? `<li><strong>Message:</strong> ${String(message)}</li>` : ''}
         ${source ? `<li><strong>Source:</strong> ${source}</li>` : ''}
       </ul>
