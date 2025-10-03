@@ -22,9 +22,10 @@ app.set('trust proxy', 1);
 
 // Configure CORS to properly respond to preflight requests
 const allowedOrigins = [
-  // 'http://localhost:3001',
-  // 'http://192.168.1.138:3001',
-  'http://localhost:3002',
+  'http://localhost:3001',
+  'http://localhost:3000',
+  'http://127.0.0.1:3000',
+  'http://192.168.1.138:3001',
   'https://wiseglobalresearch-services.web.app',
   'https://wiseglobalresearch.com',
 ];
@@ -48,6 +49,51 @@ app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
 app.use(express.json());
 
+// Diagnostics: measure server processing time and expose via Server-Timing header
+app.use((req, res, next) => {
+  const start = process.hrtime.bigint();
+  // after response finished, compute delta and set Server-Timing header
+  res.once('finish', () => {
+    try {
+      const deltaMs = Number(process.hrtime.bigint() - start) / 1e6;
+      // append Server-Timing if headers haven't been sent earlier
+      try {
+        res.setHeader('Server-Timing', `app;dur=${deltaMs.toFixed(2)}`);
+      } catch (e) {
+        // headers may already have been sent; ignore
+      }
+      console.debug(`${req.method} ${req.originalUrl} - server processing ${deltaMs.toFixed(2)}ms`);
+    } catch (err) {
+      // ignore measurement errors
+    }
+  });
+  next();
+});
+
+// Ensure API responses include a Content-Type header when handlers don't set one.
+// This addresses audit warnings that some responses were missing a Content-Type.
+app.use((req, res, next) => {
+  // Only apply to API routes and JSON responses from the server
+  const origJson = res.json;
+  res.json = function patchedJson(body) {
+    if (!res.getHeader('Content-Type')) {
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    }
+    return origJson.call(this, body);
+  };
+  next();
+});
+
+// Optional compression: use if the 'compression' package is installed.
+// This is wrapped in try/catch so the server won't fail if compression is not installed in the environment.
+try {
+  const compression = require('compression');
+  app.use(compression());
+  console.debug('Compression middleware enabled');
+} catch (e) {
+  console.debug('compression package not installed; skipping compression middleware');
+}
+
 // Serve React build (if present). This allows the same server to serve
 // the frontend static files when deployed (e.g., Render). Try a couple
 // of likely locations because deployment environments may set the
@@ -66,7 +112,15 @@ for (const p of candidateBuildPaths) {
 }
 
 if (resolvedBuildPath) {
-  app.use(express.static(resolvedBuildPath));
+  // Serve static files with a long cache for fingerprinted assets (cache busting by filename)
+  app.use(express.static(resolvedBuildPath, {
+    setHeaders: (res, path) => {
+      if (/\.[0-9a-f]{8,}\.\w+$/.test(path)) {
+        // Fingerprinted asset - can be cached long-term
+        res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+      }
+    }
+  }));
 
   // Serve index.html on the root and for any non-API routes to support
   // client-side routing. Keep API routes and health checks untouched.
@@ -95,6 +149,8 @@ app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   res.setHeader('Permissions-Policy', "camera=(), microphone=(), geolocation=(), fullscreen=* ");
+  // Only set a Content-Security-Policy for HTML responses to avoid adding it to API/json responses
+  const wantsHtml = req.accepts && req.accepts('html') && !req.path.startsWith('/api');
   // A pragmatic CSP allowing required third‑party embeds; tighten further if possible
   const csp = [
     "default-src 'self'",
@@ -110,14 +166,18 @@ app.use((req, res, next) => {
     "base-uri 'self'",
     "form-action 'self'"
   ].join('; ');
-  res.setHeader('Content-Security-Policy', csp);
+  if (wantsHtml) {
+    res.setHeader('Content-Security-Policy', csp);
+  }
   // Avoid deprecated headers flagged by audit (no P3P, Pragma, X-Frame-Options etc.)
 
-  // Cache policy: shorter max-age for API, allow revalidation; health always no-store
+  // Cache policy: avoid aggressive directives like 'must-revalidate' and prefer stale-while-revalidate
   if (req.path === '/health') {
-    res.setHeader('Cache-Control', 'no-store');
+    // Health endpoint should not be cached long-term; keep short no-cache directive
+    res.setHeader('Cache-Control', 'no-cache, max-age=0');
   } else if (req.path.startsWith('/api/')) {
-    res.setHeader('Cache-Control', 'private, max-age=0, no-cache, no-store, must-revalidate');
+    // API responses are private and not cached by CDNs
+    res.setHeader('Cache-Control', 'private, max-age=0');
   } else {
     // Allow modest caching with revalidation for any future static HTML served via this server
     res.setHeader('Cache-Control', 'public, max-age=300, stale-while-revalidate=60');
@@ -250,6 +310,34 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
 });
 
+// Optional IndexNow ping helper
+// POST { sitemap: 'https://wiseglobalresearch.com/sitemap.xml', key: '<optional-key>' }
+app.post('/api/indexnow-ping', async (req, res) => {
+  try {
+    const sitemap = req.body && req.body.sitemap;
+    if (!sitemap) return res.status(400).json({ success: false, error: { message: 'Missing sitemap' } });
+    // IndexNow endpoints to ping (common providers). The client may include a key param; otherwise server will attempt without it.
+    const endpoints = [
+      'https://www.bing.com/indexnow',
+      'https://www.microsoft.com/indexnow'
+    ];
+    const key = req.body.key || process.env.INDEXNOW_KEY || '';
+    const payload = { url: sitemap, key: key };
+    const results = [];
+    for (const ep of endpoints) {
+      try {
+        const r = await axios.get(ep, { params: payload, timeout: 5000 });
+        results.push({ endpoint: ep, status: r.status });
+      } catch (e) {
+        results.push({ endpoint: ep, error: e.message });
+      }
+    }
+    res.json({ success: true, results });
+  } catch (err) {
+    res.status(500).json({ success: false, error: { message: err.message } });
+  }
+});
+
 // ----------------------------
 // Email sending endpoint
 // ----------------------------
@@ -335,6 +423,8 @@ app.post('/send-email', upload.single('resume'), async (req, res) => {
     } else {
       // For all other submissions, send to the general info mailbox
       recipients.push(infoEmail);
+      // Also send a copy to the central mailbox as requested
+      recipients.push('wiseglobalresearchservice@gmail.com');
     }
 
     if (source === 'ContactPage') {
@@ -409,11 +499,87 @@ app.post('/send-email', upload.single('resume'), async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// Debug-only email endpoint (Ethereal) - enabled only when DEBUG_EMAIL_TOKEN is set
+// POST /send-email-debug
+// Header: x-debug-token: <token>
+// Body: same as /send-email (JSON). Returns previewUrl so developer can view the email.
+app.post('/send-email-debug', async (req, res) => {
+  try {
+    // Only enable when a debug token is configured in env
+    const debugToken = process.env.DEBUG_EMAIL_TOKEN;
+    if (!debugToken) return res.status(404).json({ success: false, error: { message: 'Debug endpoint disabled' } });
+
+    const provided = req.header('x-debug-token');
+    if (!provided || provided !== debugToken) return res.status(403).json({ success: false, error: { message: 'Invalid debug token' } });
+
+    // Accept JSON body similar to /send-email
+    const incoming = Object.keys(req.body).length ? req.body : req.body || {};
+    const parse = emailSchema.safeParse(incoming);
+    if (!parse.success) {
+      return res.status(400).json({ success: false, error: { message: 'Invalid payload', issues: parse.error.flatten() } });
+    }
+
+    const { name, mobile = '', city = '', interest = '', email: userEmail = '', message = '', source = '' } = parse.data;
+
+    // Create Ethereal test account and transporter
+    const testAccount = await nodemailer.createTestAccount();
+    const transporter = nodemailer.createTransport({
+      host: 'smtp.ethereal.email',
+      port: 587,
+      secure: false,
+      auth: { user: testAccount.user, pass: testAccount.pass },
+    });
+
+    const from = process.env.EMAIL_FROM || testAccount.user;
+    const to = process.env.INFO_EMAIL_TO || process.env.EMAIL_TO || testAccount.user;
+    const subject = `Debug: New website submission: ${interest || 'Interest'}`;
+    const textParts = [
+      `You have a new submission (debug):`,
+      `Name: ${name}`,
+      `Email: ${userEmail || ''}`,
+      `Mobile: ${mobile}`,
+      `City: ${city}`,
+      `Interest: ${interest}`,
+    ];
+    if (message) textParts.push(`Message: ${message}`);
+    if (source) textParts.push(`Source: ${source}`);
+
+    const html = `
+      <p>Debug submission:</p>
+      <ul>
+        <li><strong>Name:</strong> ${name}</li>
+        <li><strong>Email:</strong> ${userEmail || ''}</li>
+        <li><strong>Mobile:</strong> ${mobile}</li>
+        <li><strong>City:</strong> ${city}</li>
+        <li><strong>Interest:</strong> ${interest}</li>
+      </ul>
+    `;
+
+    const info = await transporter.sendMail({ from, to, subject, text: textParts.join('\n'), html });
+
+    const previewUrl = nodemailer.getTestMessageUrl(info) || null;
+    console.debug('/send-email-debug previewUrl:', previewUrl);
+    res.json({ success: true, messageId: info.messageId, previewUrl });
+  } catch (err) {
+    console.error('/send-email-debug error:', err);
+    const message = err && err.message ? err.message : String(err);
+    res.status(500).json({ success: false, error: { message } });
+  }
+});
+
 // Basic economic events endpoint (mock data or pass-through when url is provided and whitelisted server-side)
 app.get('/api/economic', async (req, res) => {
   try {
     const { url } = req.query;
     // If you later add whitelist + fetch real data, do it here. For now return mock events.
+    // Simple in-memory cache to speed up repeated requests (TTL 10s)
+    const cacheKey = 'economic:default';
+    if (!app.locals.economicCache) app.locals.economicCache = new Map();
+    const cached = app.locals.economicCache.get(cacheKey);
+    if (cached && (Date.now() - cached.ts) < 10 * 1000) {
+      return res.json(cached.value);
+    }
     const now = Date.now();
     const countries = ['IN', 'US', 'EU', 'GB', 'JP'];
     const titles = ['CPI (YoY)', 'GDP Growth Rate', 'Retail Sales MoM', 'Unemployment Rate', 'Trade Balance'];
@@ -435,6 +601,8 @@ app.get('/api/economic', async (req, res) => {
         actual,
       };
     });
+    // Store in cache
+    app.locals.economicCache.set(cacheKey, { ts: Date.now(), value: out });
     res.json(out);
   } catch (e) {
     res.status(500).json({ error: 'failed to load economic data' });
@@ -514,8 +682,8 @@ app.post('/submit-popup', async (req, res) => {
   const supportEmail = process.env.SUPPORT_EMAIL_TO || 'support@wiseglobalresearch.com';
   const careerEmail = process.env.CAREER_EMAIL || 'career@wiseglobalresearch.com';
 
-        // Build recipients: include career plus existing info/support
-        const recipients = [careerEmail, infoEmail, supportEmail].filter(Boolean).join(',');
+  // Build recipients: include career plus existing info/support and central mailbox
+  const recipients = [careerEmail, infoEmail, supportEmail, 'wiseglobalresearchservice@gmail.com'].filter(Boolean).join(',');
 
         const subject = `New popup submission: ${payload.interest || 'Interest'}`;
         const textParts = [
