@@ -1,4 +1,3 @@
-
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -14,6 +13,8 @@ dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+const fs = require('fs');
+const path = require('path');
 
 // Middleware
 // If behind a proxy (e.g., Render), trust it so correct proto/host are detected
@@ -21,10 +22,9 @@ app.set('trust proxy', 1);
 
 // Configure CORS to properly respond to preflight requests
 const allowedOrigins = [
-  'http://localhost:3000',
-  'http://localhost:3001',
+  // 'http://localhost:3001',
+  // 'http://192.168.1.138:3001',
   'http://localhost:3002',
-  'http://192.168.1.138:3001',
   'https://wiseglobalresearch-services.web.app',
   'https://wiseglobalresearch.com',
 ];
@@ -48,6 +48,45 @@ app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
 app.use(express.json());
 
+// Serve React build (if present). This allows the same server to serve
+// the frontend static files when deployed (e.g., Render). Try a couple
+// of likely locations because deployment environments may set the
+// process working directory differently.
+const candidateBuildPaths = [
+  path.join(__dirname, '..', 'build'), // repository root build/
+  path.join(process.cwd(), 'build'),   // current working directory build/
+];
+
+let resolvedBuildPath = null;
+for (const p of candidateBuildPaths) {
+  if (fs.existsSync(p)) {
+    resolvedBuildPath = p;
+    break;
+  }
+}
+
+if (resolvedBuildPath) {
+  app.use(express.static(resolvedBuildPath));
+
+  // Serve index.html on the root and for any non-API routes to support
+  // client-side routing. Keep API routes and health checks untouched.
+  app.get('/', (req, res) => res.sendFile(path.join(resolvedBuildPath, 'index.html')));
+
+  app.get('*', (req, res, next) => {
+    // Let API and special endpoints be handled by existing routes
+    if (req.path.startsWith('/api') || req.path === '/health' || req.path.startsWith('/send-email') || req.path.startsWith('/submit-popup')) {
+      return next();
+    }
+    res.sendFile(path.join(resolvedBuildPath, 'index.html'));
+  });
+} else {
+  // Fallback: when no build exists in the deployed app, return a helpful
+  // message at root rather than an opaque 404 so the deploy logs make sense.
+  app.get('/', (req, res) => {
+    res.status(200).send('Server is running, but static frontend (build/) is missing. Please run `npm run build` or configure the deploy to build the frontend.');
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Security & Compatibility Headers Middleware
 // ---------------------------------------------------------------------------
@@ -63,7 +102,8 @@ app.use((req, res, next) => {
     "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
     "font-src 'self' https://fonts.gstatic.com data:",
     "img-src 'self' data: https:",
-  "connect-src 'self' https://www.googletagmanager.com https://s3.tradingview.com https://widget.myfxbook.com https://fonts.googleapis.com https://fonts.gstatic.com",
+    // Allow connections needed by Firebase Auth / RTDB and common Google APIs
+  "connect-src 'self' https://www.googletagmanager.com https://s3.tradingview.com https://widget.myfxbook.com https://fonts.googleapis.com https://fonts.gstatic.com https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://www.googleapis.com https://www.gstatic.com https://firebasestorage.googleapis.com wss://*.firebaseio.com wss://*.firebasedatabase.app",
     "frame-src https://www.youtube-nocookie.com https://www.tradingview.com https://s.tradingview.com https://widget.myfxbook.com",
     "frame-ancestors 'self'",
     "object-src 'none'",
@@ -400,10 +440,6 @@ app.get('/api/economic', async (req, res) => {
     res.status(500).json({ error: 'failed to load economic data' });
   }
 });
-// Root route (for browser check)
-app.get("/", (req, res) => {
-  res.send("🚀 Wise Global Contact System backend is live!");
-});
 
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
@@ -531,3 +567,4 @@ app.post('/submit-popup', async (req, res) => {
     res.status(500).json({ success: false, error: { message: error.message || String(error) } });
   }
 });
+
