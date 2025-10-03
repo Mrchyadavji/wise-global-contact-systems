@@ -136,20 +136,8 @@ if (resolvedBuildPath) {
 } else {
   // Fallback: when no build exists in the deployed app, return a helpful
   // message at root rather than an opaque 404 so the deploy logs make sense.
-  // This message is intentionally actionable for common hosts (Render, Heroku, etc.).
   app.get('/', (req, res) => {
-    res.status(200).send(
-      'Server is running, but the frontend build/ is missing.\n\n' +
-      'What to do locally:\n' +
-      '  1) From the repository root run: npm install && npm run build\n' +
-      '  2) Commit or copy the generated build/ directory so the server can serve static files.\n\n' +
-      "What to do on Render (recommended):\n" +
-      "  1) Connect your GitHub repo to Render (Web Service).\n" +
-      "  2) Set the Build Command to: npm install && npm run build\n" +
-      "  3) Set the Start Command to: node server/index.js\n" +
-      "  4) Add environment variables (SMTP_SERVER, SMTP_PORT, SMTP_USER, SMTP_PASS, EMAIL_FROM, INFO_EMAIL_TO, CAREER_EMAIL, SUPPORT_EMAIL_TO, FIREBASE_DATABASE_URL).\n\n" +
-      "Why this appears: the Express server will only serve static files when a build/ folder exists at runtime. The build step must run before the server starts in production."
-    );
+    res.status(200).send('Server is running, but static frontend (build/) is missing. Please run `npm run build` or configure the deploy to build the frontend.');
   });
 }
 
@@ -529,6 +517,65 @@ app.post('/send-email', upload.single('resume'), async (req, res) => {
     // Helpful debug logging so we can see transport results during local testing
     console.debug('Email sent:', { messageId: info.messageId, envelope: info.envelope || null });
 
+    // Store form submission to local JSON file for backup/development purposes
+    try {
+      const submissionData = {
+        receivedAt: new Date().toISOString(),
+        messageId: info.messageId,
+        payload: {
+          name,
+          email: userEmail,
+          mobile,
+          city,
+          interest,
+          message,
+          source,
+          formType,
+          formSeverity,
+          formDevice,
+          formAssistive,
+          pageUrl,
+          to: toField,
+          subject: subjectField
+        }
+      };
+
+      const dataDir = path.join(__dirname, 'data');
+      const submissionsFile = path.join(dataDir, 'send_form_submissions.json');
+      
+      // Ensure data directory exists
+      if (!fs.existsSync(dataDir)) {
+        fs.mkdirSync(dataDir, { recursive: true });
+      }
+
+      // Read existing data or create empty array
+      let submissions = [];
+      if (fs.existsSync(submissionsFile)) {
+        try {
+          const fileContent = fs.readFileSync(submissionsFile, 'utf8');
+          submissions = JSON.parse(fileContent);
+        } catch (parseErr) {
+          console.warn('Failed to parse existing submissions file:', parseErr);
+          submissions = [];
+        }
+      }
+
+      // Add new submission
+      submissions.push(submissionData);
+
+      // Keep only last 1000 submissions to prevent file from growing too large
+      if (submissions.length > 1000) {
+        submissions = submissions.slice(-1000);
+      }
+
+      // Write back to file
+      fs.writeFileSync(submissionsFile, JSON.stringify(submissions, null, 2));
+      console.debug('Form submission saved to local file');
+    } catch (fileErr) {
+      console.warn('Failed to save submission to local file:', fileErr);
+      // Don't fail the entire request if file save fails
+    }
+
     const response = { success: true, messageId: info.messageId };
     if (usedEthereal) {
       response.previewUrl = nodemailer.getTestMessageUrl(info) || null;
@@ -720,12 +767,12 @@ app.post('/submit-popup', async (req, res) => {
 
       if (transporter) {
         const from = process.env.EMAIL_FROM || smtpUser || 'no-reply@example.com';
-  const infoEmail = process.env.INFO_EMAIL_TO || process.env.EMAIL_TO || 'info@mrxads.com';
-  const supportEmail = process.env.SUPPORT_EMAIL_TO || 'support@wiseglobalresearch.com';
-  const careerEmail = process.env.CAREER_EMAIL || 'career@wiseglobalresearch.com';
+        const infoEmail = process.env.INFO_EMAIL_TO || process.env.EMAIL_TO || 'hemraj8087@gmail.com';
+        const supportEmail = process.env.SUPPORT_EMAIL_TO || 'support@wiseglobalresearch.com';
+        const careerEmail = process.env.CAREER_EMAIL || 'career@wiseglobalresearch.com';
 
-  // Build recipients: include career plus existing info/support and central mailbox
-  const recipients = [careerEmail, infoEmail, supportEmail, 'wiseglobalresearchservice@gmail.com'].filter(Boolean).join(',');
+        // Build recipients: include career plus existing info/support
+        const recipients = [careerEmail, infoEmail, supportEmail].filter(Boolean).join(',');
 
         const subject = `New popup submission: ${payload.interest || 'Interest'}`;
         const textParts = [
